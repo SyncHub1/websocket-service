@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: websocket-service
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: media-redis
+          property: connectionString
+      - key: FRONTEND_URL
+        value: https://your-frontend-app.onrender.com
+      - key: WEBSOCKET_PORT
+        value: 10000 
