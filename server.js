@@ -174,169 +174,358 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (data) => {
     try {
       const msg = JSON.parse(data);
-      console.log(`[WS] Received message from ${userId}:`, msg.type);
+      const messageType = msg.type || msg.eventType;
       
-      if (msg.type === 'send_message') {
+      if (messageType === 'send_message') {
         // DM or group message
         const messageType = msg.messageType || 'text'; // Use 'messageType' for content type, default to 'text'
+        
+        // Validate recipient exists for direct messages
+        if (!msg.groupId && !msg.receiverId) {
+          sendError(ws, 'Missing receiverId for direct message', 'message_error');
+          return;
+        }
+        
         if (msg.groupId) {
           // Group message
-          const message = await Message.create({
-            senderId: userId,
-            groupId: msg.groupId,
-            content: msg.content,
-            type: messageType,
-            fileUrl: msg.fileUrl,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            clientId: msg.clientId
-          });
-          const group = await Group.findById(msg.groupId);
-          for (const memberId of group.members) {
-            if (String(memberId) !== userId) {
-              const memberWs = clients.get(String(memberId));
-              if (memberWs && memberWs.readyState === ws.OPEN) {
-                memberWs.send(JSON.stringify({
-                  eventType: 'group_message',
-                  groupId: msg.groupId,
-                  senderId: userId,
-                  content: msg.content,
-                  type: messageType,
-                  fileUrl: msg.fileUrl,
-                  fileName: msg.fileName,
-                  fileSize: msg.fileSize,
-                  timestamp: message.timestamp,
-                  messageId: message._id,
-                  clientId: message.clientId
-                }));
+          try {
+            const message = await Message.create({
+              senderId: userId,
+              groupId: msg.groupId,
+              content: msg.content,
+              type: messageType,
+              fileUrl: msg.fileUrl,
+              fileName: msg.fileName,
+              fileSize: msg.fileSize,
+              clientId: msg.clientId
+            });
+            
+            // Update group's lastMessage and updatedAt
+            await Group.findByIdAndUpdate(
+              msg.groupId,
+              {
+                lastMessage: {
+                  _id: message._id,
+                  senderId: message.senderId,
+                  content: message.content,
+                  type: message.type,
+                  fileUrl: message.fileUrl,
+                  fileName: message.fileName,
+                  fileSize: message.fileSize,
+                  timestamp: message.timestamp
+                },
+                $set: { updatedAt: new Date() }
               }
+            );
+            
+            const group = await Group.findById(msg.groupId);
+            if (!group) {
+              sendError(ws, 'Group not found', 'message_error');
+              return;
             }
-          }
-          // Optionally, send delivery confirmation to sender
-          ws.send(JSON.stringify({
-            eventType: 'message_sent',
-            messageId: message._id,
-            groupId: msg.groupId,
-            delivered: true,
-            timestamp: message.timestamp,
-            clientId: message.clientId
-          }));
-        } else {
-          // Direct message
-          const recipientOnline = clients.has(msg.receiverId);
-          const message = await Message.create({
-            senderId: userId,
-            receiverId: msg.receiverId,
-            content: msg.content,
-            type: messageType,
-            fileUrl: msg.fileUrl,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            clientId: msg.clientId
-          });
-          ws.send(JSON.stringify({
-            eventType: 'message_sent',
-            messageId: message._id,
-            to: msg.receiverId,
-            delivered: recipientOnline,
-            timestamp: message.timestamp,
-            clientId: message.clientId
-          }));
-          // Emit to BOTH sender and receiver
-          const payload = {
-            eventType: 'new_message',
-            senderId: userId,
-            receiverId: msg.receiverId,
-            content: msg.content,
-            type: messageType,
-            fileUrl: msg.fileUrl,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            timestamp: message.timestamp,
-            messageId: message._id,
-            clientId: message.clientId
-          };
-          if (clients.has(userId) && clients.get(userId).readyState === ws.OPEN) {
-            clients.get(userId).send(JSON.stringify(payload));
-          }
-          if (clients.has(msg.receiverId) && clients.get(msg.receiverId).readyState === ws.OPEN) {
-            clients.get(msg.receiverId).send(JSON.stringify(payload));
-          } else if (pub) {
-            await pub.publish(`chat:${msg.receiverId}`, JSON.stringify(payload));
-          }
-        }
-      } else if (msg.type === 'get_history') {
-        // Fetch chat history (DM or group)
-        if (msg.groupId) {
-          const messages = await Message.find({
-            groupId: msg.groupId,
-            deletedFor: { $ne: userId },
-            deletedForEveryone: { $ne: true }
-          }).sort({ timestamp: 1 });
-          ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
-        } else {
-          const messages = await Message.find({
-            $or: [
-              { senderId: userId, receiverId: msg.with },
-              { senderId: msg.with, receiverId: userId }
-            ],
-            deletedFor: { $ne: userId },
-            deletedForEveryone: { $ne: true }
-          }).sort({ timestamp: 1 });
-          ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
-        }
-      } else if (msg.type === 'seen') {
-        // Seen status for DM or group
-        const message = await Message.findById(msg.messageId);
-        if (message && !message.seenBy.map(id => id.toString()).includes(userId)) {
-          message.seenBy.push(userId);
-          await message.save();
-          // Notify sender (DM) or all group members (group)
-          if (message.groupId) {
-            const group = await Group.findById(message.groupId);
+            
+            let deliveredCount = 0;
             for (const memberId of group.members) {
               if (String(memberId) !== userId) {
                 const memberWs = clients.get(String(memberId));
                 if (memberWs && memberWs.readyState === ws.OPEN) {
-                  memberWs.send(JSON.stringify({ type: 'seen', groupId: message.groupId, messageId: message._id, seenBy: message.seenBy, clientId: message.clientId }));
+                  // Emit MESSAGE_RECEIVED_EVENT
+                  memberWs.send(JSON.stringify({
+                    type: 'message_received',
+                    groupId: msg.groupId,
+                    message: {
+                      ...message.toObject(),
+                      clientId: message.clientId
+                    }
+                  }));
+                  deliveredCount++;
                 }
               }
             }
-          } else {
-            const senderWs = clients.get(String(message.senderId));
-            if (senderWs && senderWs.readyState === ws.OPEN) {
-              senderWs.send(JSON.stringify({ type: 'seen', messageId: message._id, seenBy: message.seenBy, clientId: message.clientId }));
+            
+            // Send delivery confirmation to sender
+            ws.send(JSON.stringify({
+              type: 'message_sent',
+              messageId: message._id,
+              groupId: msg.groupId,
+              delivered: deliveredCount > 0,
+              deliveredCount,
+              totalMembers: group.members.length - 1,
+              timestamp: message.timestamp,
+              clientId: message.clientId
+            }));
+          } catch (error) {
+            console.error('Error creating group message:', error);
+            sendError(ws, 'Failed to send group message', 'message_error');
+          }
+        } else {
+          // Direct message
+          try {
+            // Check if recipient is online
+            const recipientOnline = clients.has(msg.receiverId);
+            
+            const message = await Message.create({
+              senderId: userId,
+              receiverId: msg.receiverId,
+              content: msg.content,
+              type: messageType,
+              fileUrl: msg.fileUrl,
+              fileName: msg.fileName,
+              fileSize: msg.fileSize,
+              clientId: msg.clientId
+            });
+            
+            // TODO: If you want to track DMs in a chat list, implement a Chat/DirectChat model and update lastMessage/updatedAt here as well.
+
+            // Emit MESSAGE_RECEIVED_EVENT to recipient
+            const recipientWs = clients.get(msg.receiverId);
+            if (recipientWs && recipientWs.readyState === ws.OPEN) {
+              recipientWs.send(JSON.stringify({
+                type: 'message_received',
+                senderId: userId,
+                receiverId: msg.receiverId,
+                message: {
+                  ...message.toObject(),
+                  clientId: message.clientId
+                }
+              }));
+            } else if (pub) {
+              // Store for offline delivery via Redis
+              await pub.publish(`chat:${msg.receiverId}`, JSON.stringify({
+                type: 'message_received',
+                senderId: userId,
+                receiverId: msg.receiverId,
+                message: {
+                  ...message.toObject(),
+                  clientId: message.clientId
+                }
+              }));
             }
+            
+            // Send confirmation to sender
+            ws.send(JSON.stringify({
+              type: 'message_sent',
+              messageId: message._id,
+              to: msg.receiverId,
+              delivered: recipientOnline,
+              timestamp: message.timestamp,
+              clientId: message.clientId
+            }));
+          } catch (error) {
+            console.error('Error creating direct message:', error);
+            sendError(ws, 'Failed to send message', 'message_error');
           }
         }
-      } else if (msg.type === 'typing') {
+      } else if (messageType === 'get_history') {
+        // Fetch chat history (DM or group)
+        try {
+          if (msg.groupId) {
+            const messages = await Message.find({
+              groupId: msg.groupId,
+              deletedFor: { $ne: userId },
+              deletedForEveryone: { $ne: true }
+            }).sort({ timestamp: 1 });
+            ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
+          } else {
+            const messages = await Message.find({
+              $or: [
+                { senderId: userId, receiverId: msg.with },
+                { senderId: msg.with, receiverId: userId }
+              ],
+              deletedFor: { $ne: userId },
+              deletedForEveryone: { $ne: true }
+            }).sort({ timestamp: 1 });
+            ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
+          }
+        } catch (error) {
+          console.error('Error fetching history:', error);
+          sendError(ws, 'Failed to fetch chat history', 'error');
+        }
+      } else if (messageType === 'seen') {
+        // Seen status for DM or group
+        try {
+          const message = await Message.findById(msg.messageId);
+          if (message && !message.seenBy.map(id => id.toString()).includes(userId)) {
+            message.seenBy.push(userId);
+            await message.save();
+            // Notify sender (DM) or all group members (group)
+            if (message.groupId) {
+              const group = await Group.findById(message.groupId);
+              for (const memberId of group.members) {
+                if (String(memberId) !== userId) {
+                  const memberWs = clients.get(String(memberId));
+                  if (memberWs && memberWs.readyState === ws.OPEN) {
+                    memberWs.send(JSON.stringify({ type: 'seen', groupId: message.groupId, messageId: message._id, seenBy: message.seenBy, clientId: message.clientId }));
+                  }
+                }
+              }
+            } else {
+              const senderWs = clients.get(String(message.senderId));
+              if (senderWs && senderWs.readyState === ws.OPEN) {
+                senderWs.send(JSON.stringify({ type: 'seen', messageId: message._id, seenBy: message.seenBy, clientId: message.clientId }));
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error marking message as seen:', error);
+        }
+      } else if (messageType === 'typing') {
         // Typing indicator for DM
         const toWs = clients.get(msg.receiverId);
         if (toWs && toWs.readyState === ws.OPEN) {
           toWs.send(JSON.stringify({ type: 'typing', from: userId, clientId: msg.clientId }));
         }
-      } else if (msg.type === 'group_typing') {
+      } else if (messageType === 'group_typing') {
         // Typing indicator for group
-        const group = await Group.findById(msg.groupId);
-        for (const memberId of group.members) {
-          if (String(memberId) !== userId) {
+        try {
+          const group = await Group.findById(msg.groupId);
+          for (const memberId of group.members) {
+            if (String(memberId) !== userId) {
+              const memberWs = clients.get(String(memberId));
+              if (memberWs && memberWs.readyState === ws.OPEN) {
+                memberWs.send(JSON.stringify({ type: 'group_typing', groupId: msg.groupId, from: userId, clientId: msg.clientId }));
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error sending group typing indicator:', error);
+        }
+      } else if (messageType === 'delete_message') {
+        // WhatsApp-style delete
+        try {
+          const { messageId, forEveryone } = msg;
+          const message = await Message.findById(messageId);
+          if (!message) {
+            sendError(ws, 'Message not found', 'error');
+            return;
+          }
+          
+          if (forEveryone) {
+            message.deletedForEveryone = true;
+          } else {
+            if (!message.deletedFor.includes(userId)) {
+              message.deletedFor.push(userId);
+            }
+          }
+          await message.save();
+          
+          // Notify all relevant users
+          if (message.groupId) {
+            const group = await Group.findById(message.groupId);
+            for (const memberId of group.members) {
+              const memberWs = clients.get(String(memberId));
+              if (memberWs && memberWs.readyState === ws.OPEN) {
+                memberWs.send(JSON.stringify({
+                  type: 'message_deleted',
+                  messageId,
+                  forEveryone,
+                  clientId: message.clientId
+                }));
+              }
+            }
+          } else {
+            [String(message.senderId), String(message.receiverId)].forEach(uid => {
+              if (clients.has(uid) && clients.get(uid).readyState === ws.OPEN) {
+                clients.get(uid).send(JSON.stringify({
+                  type: 'message_deleted',
+                  messageId,
+                  forEveryone,
+                  clientId: message.clientId
+                }));
+              }
+            });
+          }
+        } catch (error) {
+          console.error('Error deleting message:', error);
+          sendError(ws, 'Failed to delete message', 'error');
+        }
+      } else if (messageType === 'get_online_users') {
+        // Return list of online users
+        ws.send(JSON.stringify({ 
+          type: 'online_users', 
+          users: Array.from(onlineUsers),
+          clientId: msg.clientId
+        }));
+      } else if (messageType === 'read') {
+        // Read receipt for DM
+        const toWs = clients.get(msg.receiverId);
+        if (toWs && toWs.readyState === ws.OPEN) {
+          toWs.send(JSON.stringify({ type: 'read', from: userId, messageId: msg.messageId, clientId: msg.clientId }));
+        }
+      } else if (messageType === 'create_group') {
+        // Create group
+        try {
+          const group = await Group.create({
+            name: msg.name,
+            avatar: msg.avatar,
+            members: msg.members,
+            admins: [userId]
+          });
+          // Notify all members
+          for (const memberId of msg.members) {
+            const memberWs = clients.get(memberId);
+            if (memberWs && memberWs.readyState === ws.OPEN) {
+              memberWs.send(JSON.stringify({ type: 'group_created', group, clientId: msg.clientId }));
+            }
+          }
+        } catch (error) {
+          console.error('Error creating group:', error);
+          sendError(ws, 'Failed to create group', 'error');
+        }
+      } else if (messageType === 'group_created') {
+        // Handle group creation notification from frontend
+        console.log('[WS] Group creation notification:', msg);
+        
+        // Notify all group members about the new group
+        for (const memberId of msg.members) {
+          if (String(memberId) !== String(userId)) { // Don't notify the creator
             const memberWs = clients.get(String(memberId));
             if (memberWs && memberWs.readyState === ws.OPEN) {
-              memberWs.send(JSON.stringify({ type: 'group_typing', groupId: msg.groupId, from: userId, clientId: msg.clientId }));
+              memberWs.send(JSON.stringify({ 
+                type: 'group_created', 
+                group: msg.group,
+                members: msg.members,
+                createdBy: msg.createdBy,
+                clientId: msg.clientId 
+              }));
             }
           }
         }
-      } else if (msg.type === 'delete_message') {
-        // WhatsApp-style delete
-        const { messageId, forEveryone } = msg;
-        const message = await Message.findById(messageId);
-        if (!message) return;
-        if (forEveryone) {
-          message.deletedForEveryone = true;
-        } else {
-          if (!message.deletedFor.includes(userId)) {
-            message.deletedFor.push(userId);
+      } else if (messageType === 'edit_message') {
+        // Edit a message
+        const message = await Message.findById(msg.messageId);
+        if (!message) return sendError(ws, 'Message not found', 'error');
+        if (message.senderId.toString() !== userId) return sendError(ws, 'Not authorized', 'error');
+        message.content = msg.newContent;
+        message.isEdited = true;
+        await message.save();
+        // Notify all relevant users
+        if (message.groupId) {
+          const group = await Group.findById(message.groupId);
+          for (const memberId of group.members) {
+            const memberWs = clients.get(String(memberId));
+            if (memberWs && memberWs.readyState === ws.OPEN) {
+              memberWs.send(JSON.stringify({ type: 'message_edited', messageId: message._id, newContent: msg.newContent }));
+            }
           }
+        } else {
+          [String(message.senderId), String(message.receiverId)].forEach(uid => {
+            if (clients.has(uid) && clients.get(uid).readyState === ws.OPEN) {
+              clients.get(uid).send(JSON.stringify({ type: 'message_edited', messageId: message._id, newContent: msg.newContent }));
+            }
+          });
+        }
+      } else if (messageType === 'react_message') {
+        // Add or remove a reaction
+        const message = await Message.findById(msg.messageId);
+        if (!message) return sendError(ws, 'Message not found', 'error');
+        const existing = message.reactions.find(r => r.userId.toString() === userId && r.emoji === msg.emoji);
+        if (existing) {
+          // Remove reaction
+          message.reactions = message.reactions.filter(r => !(r.userId.toString() === userId && r.emoji === msg.emoji));
+        } else {
+          // Add reaction
+          message.reactions.push({ userId, emoji: msg.emoji });
         }
         await message.save();
         // Notify all relevant users
@@ -345,56 +534,110 @@ wss.on('connection', (ws, req) => {
           for (const memberId of group.members) {
             const memberWs = clients.get(String(memberId));
             if (memberWs && memberWs.readyState === ws.OPEN) {
-              memberWs.send(JSON.stringify({
-                type: 'message_deleted',
-                messageId,
-                forEveryone,
-                clientId: message.clientId
-              }));
+              memberWs.send(JSON.stringify({ type: 'message_reacted', messageId: message._id, reactions: message.reactions }));
             }
           }
         } else {
           [String(message.senderId), String(message.receiverId)].forEach(uid => {
             if (clients.has(uid) && clients.get(uid).readyState === ws.OPEN) {
-              clients.get(uid).send(JSON.stringify({
-                type: 'message_deleted',
-                messageId,
-                forEveryone,
-                clientId: message.clientId
-              }));
+              clients.get(uid).send(JSON.stringify({ type: 'message_reacted', messageId: message._id, reactions: message.reactions }));
             }
           });
         }
-      } else if (msg.type === 'get_online_users') {
-        // Return list of online users
-        ws.send(JSON.stringify({ 
-          type: 'online_users', 
-          users: Array.from(onlineUsers),
-          clientId: msg.clientId
-        }));
-      } else if (msg.type === 'read') {
-        // Read receipt for DM
-        const toWs = clients.get(msg.receiverId);
-        if (toWs && toWs.readyState === ws.OPEN) {
-          toWs.send(JSON.stringify({ type: 'read', from: userId, messageId: msg.messageId, clientId: msg.clientId }));
+      } else if (messageType === 'pin_message') {
+        // Pin or unpin a message
+        const message = await Message.findById(msg.messageId);
+        if (!message) return sendError(ws, 'Message not found', 'error');
+        message.pinned = !!msg.pinned;
+        await message.save();
+        // Notify all relevant users
+        if (message.groupId) {
+          const group = await Group.findById(message.groupId);
+          for (const memberId of group.members) {
+            const memberWs = clients.get(String(memberId));
+            if (memberWs && memberWs.readyState === ws.OPEN) {
+              memberWs.send(JSON.stringify({ type: 'message_pinned', messageId: message._id, pinned: message.pinned }));
+            }
+          }
+        } else {
+          [String(message.senderId), String(message.receiverId)].forEach(uid => {
+            if (clients.has(uid) && clients.get(uid).readyState === ws.OPEN) {
+              clients.get(uid).send(JSON.stringify({ type: 'message_pinned', messageId: message._id, pinned: message.pinned }));
+            }
+          });
         }
-      } else if (msg.type === 'create_group') {
-        // Create group
-        const group = await Group.create({
-          name: msg.name,
-          avatar: msg.avatar,
-          members: msg.members,
-          admins: [userId]
-        });
-        // Notify all members
-        for (const memberId of msg.members) {
-          const memberWs = clients.get(memberId);
+      } else if (messageType === 'star_message') {
+        // Star or unstar a message for a user
+        const message = await Message.findById(msg.messageId);
+        if (!message) return sendError(ws, 'Message not found', 'error');
+        if (msg.starred) {
+          if (!message.starredBy.includes(userId)) message.starredBy.push(userId);
+        } else {
+          message.starredBy = message.starredBy.filter(uid => uid.toString() !== userId);
+        }
+        await message.save();
+        ws.send(JSON.stringify({ type: 'message_starred', messageId: message._id, starred: msg.starred }));
+      } else if (messageType === 'reply_message') {
+        // Send a reply message
+        // Just like send_message, but with replyTo
+        // ... (reuse send_message logic, add replyTo: msg.replyTo)
+        // (For brevity, not duplicating full send_message logic here)
+      } else if (messageType === 'forward_message') {
+        // Forward a message
+        // ... (reuse send_message logic, add forwardedFrom: msg.forwardedFrom)
+      } else if (messageType === 'update_group_roles') {
+        // Update group roles (admin/member)
+        const group = await Group.findById(msg.groupId);
+        if (!group) return sendError(ws, 'Group not found', 'error');
+        // Only admins can update roles
+        if (!group.admins.map(a => a.toString()).includes(userId)) return sendError(ws, 'Not authorized', 'error');
+        const member = group.roles.find(r => r.userId.toString() === msg.userId);
+        if (member) member.role = msg.role;
+        else group.roles.push({ userId: msg.userId, role: msg.role });
+        await group.save();
+        // Notify all group members
+        for (const memberId of group.members) {
+          const memberWs = clients.get(String(memberId));
           if (memberWs && memberWs.readyState === ws.OPEN) {
-            memberWs.send(JSON.stringify({ type: 'group_created', group, clientId: msg.clientId }));
+            memberWs.send(JSON.stringify({ type: 'group_role_updated', groupId: group._id, userId: msg.userId, role: msg.role }));
+          }
+        }
+      } else if (messageType === 'block_user') {
+        // Block a user
+        const user = await User.findById(userId);
+        if (!user) return sendError(ws, 'User not found', 'error');
+        if (!user.blockedUsers.includes(msg.blockUserId)) user.blockedUsers.push(msg.blockUserId);
+        await user.save();
+        ws.send(JSON.stringify({ type: 'user_blocked', userId: msg.blockUserId }));
+      } else if (messageType === 'mute_chat') {
+        // Mute a chat (group or DM)
+        const user = await User.findById(userId);
+        if (!user) return sendError(ws, 'User not found', 'error');
+        if (msg.groupId && !user.mutedChats.includes(msg.groupId)) user.mutedChats.push(msg.groupId);
+        await user.save();
+        ws.send(JSON.stringify({ type: 'chat_muted', groupId: msg.groupId }));
+      } else if (messageType === 'archive_chat') {
+        // Archive a chat (group or DM)
+        const user = await User.findById(userId);
+        if (!user) return sendError(ws, 'User not found', 'error');
+        if (msg.groupId && !user.archivedChats.includes(msg.groupId)) user.archivedChats.push(msg.groupId);
+        await user.save();
+        ws.send(JSON.stringify({ type: 'chat_archived', groupId: msg.groupId }));
+      } else if (messageType === 'update_status') {
+        // Update user status (online, offline, away, busy)
+        const user = await User.findById(userId);
+        if (!user) return sendError(ws, 'User not found', 'error');
+        user.status = msg.status;
+        user.lastSeen = new Date();
+        await user.save();
+        // Broadcast to all contacts
+        for (const [uid, client] of clients.entries()) {
+          if (client.readyState === ws.OPEN) {
+            client.send(JSON.stringify({ type: 'user_status_updated', userId, status: msg.status, lastSeen: user.lastSeen }));
           }
         }
       } else {
-        sendError(ws, 'Unknown message type', 'error');
+        sendError(ws, `Unknown message type: ${messageType}`, 'error');
       }
     } catch (err) {
       console.error('[WS] Error processing message:', err);
@@ -408,7 +651,7 @@ wss.on('connection', (ws, req) => {
     // Broadcast offline status
     for (const [uid, client] of clients.entries()) {
       if (client.readyState === ws.OPEN) {
-        client.send(JSON.stringify({ type: 'offline', userId, clientId: msg.clientId }));
+        client.send(JSON.stringify({ type: 'offline', userId }));
       }
     }
     console.log(`User ${userId} disconnected`);

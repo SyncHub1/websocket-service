@@ -6,7 +6,12 @@ const UserSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   avatar: { type: String },
   password: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  mutedChats: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }],
+  archivedChats: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }],
+  lastSeen: { type: Date, default: Date.now },
+  status: { type: String, enum: ['online', 'offline', 'away', 'busy'], default: 'offline' }
 });
 
 const User = mongoose.model('User', UserSchema);

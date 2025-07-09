@@ -5,7 +5,16 @@ const GroupSchema = new mongoose.Schema({
   avatar: { type: String },
   members: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   admins: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-  createdAt: { type: Date, default: Date.now }
+  roles: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, role: { type: String, enum: ['admin', 'member'], default: 'member' } }],
+  description: { type: String, default: '' },
+  isArchived: { type: Boolean, default: false },
+  isMuted: { type: Boolean, default: false },
+  lastMessage: {
+    type: Object, // Can be changed to message ID if preferred
+    default: null
+  }
+}, {
+  timestamps: true // Adds createdAt and updatedAt
 });
 
 const Group = mongoose.model('Group', GroupSchema);
