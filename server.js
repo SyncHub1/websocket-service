@@ -1,4 +1,4 @@
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import Redis from 'ioredis';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
@@ -68,7 +68,99 @@ async function connectToMongoDB() {
 // Connect to MongoDB
 await connectToMongoDB();
 
-
+// Subscribe to Redis events for real-time message deletion
+if (sub) {
+  try {
+    await sub.subscribe('chat:delete');
+    console.log('✅ Subscribed to Redis chat:delete events');
+    
+    sub.on('message', async (channel, message) => {
+      if (channel === 'chat:delete') {
+        try {
+          const deleteEvent = JSON.parse(message);
+          console.log('📨 Received Redis delete event:', deleteEvent);
+          console.log('📨 Available clients:', Array.from(clients.keys()));
+          
+          const { messageId, groupId, senderId, receiverId, forEveryone } = deleteEvent;
+          
+          if (forEveryone) {
+            // Delete for everyone - notify all relevant users
+            if (groupId) {
+              // Group message deletion
+              try {
+                const group = await Group.findById(groupId);
+                if (group) {
+                  console.log('📨 Group members:', group.members);
+                  for (const memberId of group.members) {
+                    const memberWs = clients.get(String(memberId));
+                    console.log(`📨 Member ${memberId}: WebSocket exists: ${!!memberWs}, readyState: ${memberWs?.readyState}`);
+                    if (memberWs && memberWs.readyState === WebSocket.OPEN) {
+                      const deleteMessage = {
+                        type: 'message_deleted',
+                        messageId,
+                        forEveryone: true,
+                        groupId
+                      };
+                      console.log('📨 Sending delete message to group member:', memberId, deleteMessage);
+                      memberWs.send(JSON.stringify(deleteMessage));
+                    }
+                  }
+                }
+              } catch (error) {
+                console.error('Error handling group message deletion:', error);
+              }
+            } else {
+              // Direct message deletion
+              const senderWs = clients.get(String(senderId));
+              const receiverWs = clients.get(String(receiverId));
+              
+              console.log(`📨 Sender ${senderId}: WebSocket exists: ${!!senderWs}, readyState: ${senderWs?.readyState}`);
+              console.log(`📨 Receiver ${receiverId}: WebSocket exists: ${!!receiverWs}, readyState: ${receiverWs?.readyState}`);
+              
+              if (senderWs && senderWs.readyState === WebSocket.OPEN) {
+                const deleteMessage = {
+                  type: 'message_deleted',
+                  messageId,
+                  forEveryone: true
+                };
+                console.log('📨 Sending delete message to sender:', senderId, deleteMessage);
+                senderWs.send(JSON.stringify(deleteMessage));
+              }
+              
+              if (receiverWs && receiverWs.readyState === WebSocket.OPEN) {
+                const deleteMessage = {
+                  type: 'message_deleted',
+                  messageId,
+                  forEveryone: true
+                };
+                console.log('📨 Sending delete message to receiver:', receiverId, deleteMessage);
+                receiverWs.send(JSON.stringify(deleteMessage));
+              }
+            }
+          } else {
+            // Delete for me - only notify the specific user
+            const userId = deleteEvent.userId;
+            const userWs = clients.get(String(userId));
+            console.log(`📨 User ${userId}: WebSocket exists: ${!!userWs}, readyState: ${userWs?.readyState}`);
+            if (userWs && userWs.readyState === WebSocket.OPEN) {
+              const deleteMessage = {
+                type: 'message_deleted',
+                messageId,
+                forEveryone: false
+              };
+              console.log('📨 Sending delete for me message to user:', userId, deleteMessage);
+              userWs.send(JSON.stringify(deleteMessage));
+            }
+          }
+        } catch (error) {
+          console.error('Error processing Redis delete event:', error);
+        }
+      }
+    });
+  } catch (error) {
+    console.error('❌ Failed to subscribe to Redis events:', error);
+  }
+}
 
 // Handle MongoDB connection events
 mongoose.connection.on('connected', () => {
@@ -197,7 +289,8 @@ wss.on('connection', (ws, req) => {
               fileUrl: msg.fileUrl,
               fileName: msg.fileName,
               fileSize: msg.fileSize,
-              clientId: msg.clientId
+              clientId: msg.clientId,
+              ...(msg.replyTo ? { replyTo: msg.replyTo } : {}) // NEW: support replyTo
             });
             
             // Update group's lastMessage and updatedAt
@@ -272,7 +365,8 @@ wss.on('connection', (ws, req) => {
               fileUrl: msg.fileUrl,
               fileName: msg.fileName,
               fileSize: msg.fileSize,
-              clientId: msg.clientId
+              clientId: msg.clientId,
+              ...(msg.replyTo ? { replyTo: msg.replyTo } : {}) // NEW: support replyTo
             });
             
             // TODO: If you want to track DMs in a chat list, implement a Chat/DirectChat model and update lastMessage/updatedAt here as well.
@@ -292,6 +386,19 @@ wss.on('connection', (ws, req) => {
             } else if (pub) {
               // Store for offline delivery via Redis
               await pub.publish(`chat:${msg.receiverId}`, JSON.stringify({
+                type: 'message_received',
+                senderId: userId,
+                receiverId: msg.receiverId,
+                message: {
+                  ...message.toObject(),
+                  clientId: message.clientId
+                }
+              }));
+            }
+            // Emit MESSAGE_RECEIVED_EVENT to sender (so sender sees their own message in real time)
+            const senderWs = clients.get(userId);
+            if (senderWs && senderWs.readyState === ws.OPEN) {
+              senderWs.send(JSON.stringify({
                 type: 'message_received',
                 senderId: userId,
                 receiverId: msg.receiverId,
@@ -322,8 +429,8 @@ wss.on('connection', (ws, req) => {
           if (msg.groupId) {
             const messages = await Message.find({
               groupId: msg.groupId,
-              deletedFor: { $ne: userId },
-              deletedForEveryone: { $ne: true }
+              hiddenFor: { $ne: userId },
+              isDeleted: { $ne: true }
             }).sort({ timestamp: 1 });
             ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
           } else {
@@ -332,8 +439,8 @@ wss.on('connection', (ws, req) => {
                 { senderId: userId, receiverId: msg.with },
                 { senderId: msg.with, receiverId: userId }
               ],
-              deletedFor: { $ne: userId },
-              deletedForEveryone: { $ne: true }
+              hiddenFor: { $ne: userId },
+              isDeleted: { $ne: true }
             }).sort({ timestamp: 1 });
             ws.send(JSON.stringify({ type: 'history', messages: messages.map(m => ({ ...m.toObject(), clientId: m.clientId })) }));
           }
@@ -401,10 +508,16 @@ wss.on('connection', (ws, req) => {
           }
           
           if (forEveryone) {
-            message.deletedForEveryone = true;
+            // Only sender can delete for everyone
+            if (String(message.senderId) !== String(userId)) {
+              sendError(ws, 'Only the sender can delete for everyone', 'error');
+              return;
+            }
+            message.isDeleted = true;
           } else {
-            if (!message.deletedFor.includes(userId)) {
-              message.deletedFor.push(userId);
+            // Delete for me - add user to hiddenFor array
+            if (!message.hiddenFor.includes(userId)) {
+              message.hiddenFor.push(userId);
             }
           }
           await message.save();
@@ -414,23 +527,22 @@ wss.on('connection', (ws, req) => {
             const group = await Group.findById(message.groupId);
             for (const memberId of group.members) {
               const memberWs = clients.get(String(memberId));
-              if (memberWs && memberWs.readyState === ws.OPEN) {
+              if (memberWs && memberWs.readyState === WebSocket.OPEN) {
                 memberWs.send(JSON.stringify({
                   type: 'message_deleted',
                   messageId,
                   forEveryone,
-                  clientId: message.clientId
+                  groupId: message.groupId
                 }));
               }
             }
           } else {
             [String(message.senderId), String(message.receiverId)].forEach(uid => {
-              if (clients.has(uid) && clients.get(uid).readyState === ws.OPEN) {
+              if (clients.has(uid) && clients.get(uid).readyState === WebSocket.OPEN) {
                 clients.get(uid).send(JSON.stringify({
                   type: 'message_deleted',
                   messageId,
-                  forEveryone,
-                  clientId: message.clientId
+                  forEveryone
                 }));
               }
             });
