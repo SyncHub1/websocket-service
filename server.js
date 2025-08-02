@@ -18,6 +18,19 @@ const REDIS_HOST = process.env.REDIS_HOST;
 const REDIS_PORT = process.env.REDIS_PORT;
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 
+// CORS configuration for WebSocket
+const corsOptions = {
+  origin: [
+    process.env.FRONTEND_URL || 'http://localhost:3000',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:8080',
+    'https://www.synchubb.in',
+    'https://synchubb-matri-frontend.vercel.app'
+  ],
+  credentials: true
+};
+
 
 // Initialize Redis with error handling
 let redis, pub, sub;
